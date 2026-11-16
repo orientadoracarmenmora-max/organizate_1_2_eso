@@ -237,7 +237,178 @@ html[data-access-font] :is(body,h1,h2,h3,h4,.svg-label,.svg-small,.svg-break) { 
   html[data-access-contrast] :focus-visible { outline-color: var(--ink); }
 }
 </style>
- </head>
+ <script>
+const FUENTE_PIPER = "\nlet model, config, phonemizer;\nconst phonemizerBase = 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/';\nconst runtimeBase = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.3/dist/';\nconst voiceBase = 'https://huggingface.co/rhasspy/piper-voices/resolve/main/es/es_ES/';\nconst models = {\n  piper: 'sharvard/medium/es_ES-sharvard-medium.onnx'\n};\nlet phrases = [];\n\nasync function fetchModel(url) {\n  let cache;\n  try {\n    cache = await self.caches.open('piper-sharvard-v1');\n    const saved = await cache.match(url);\n    if (saved) return { response: saved, save: async () => {} };\n  } catch (error) {\n    console.warn('Piper: almacenamiento no disponible', error);\n  }\n  const response = await fetch(url);\n  if (!response.ok) throw new Error('Descarga de Piper: ' + response.status);\n  const copy = cache ? response.clone() : null;\n  return {\n    response,\n    async save() {\n      if (!copy) return;\n      try {\n        await cache.put(url, copy);\n      } catch (error) {\n        console.warn('Piper: no se pudo guardar la voz', error);\n      }\n    }\n  };\n}\n\nasync function readVoiceModel(response) {\n  const total = Number(response.headers.get('content-length'));\n  if (!total || !response.body) return response.arrayBuffer();\n  const reader = response.body.getReader();\n  const chunks = [];\n  let loaded = 0;\n  let lastPercent = -1;\n  while (true) {\n    const { done, value } = await reader.read();\n    if (done) break;\n    chunks.push(value);\n    loaded += value.byteLength;\n    const percent = Math.min(99, Math.floor(loaded * 100 / total));\n    if (percent !== lastPercent) {\n      lastPercent = percent;\n      self.postMessage({ percent });\n    }\n  }\n  return new Blob(chunks).arrayBuffer();\n}\n\nlet pending = Promise.resolve();\nself.onmessage = ({ data }) => {\n  pending = pending.then(() => synthesize(data));\n};\n\nasync function synthesize({ text, speed, id, modelKey }) {\n  try {\n    if (!model) {\n      const modelUrl = voiceBase + models[modelKey];\n      importScripts(runtimeBase + 'ort.wasm.min.js',\n        'https://cdn.jsdelivr.net/gh/piper-tts/piper-tts.github.io@main/vendor/phonemize/piper_phonemize.js');\n      ort.env.wasm.wasmPaths = runtimeBase;\n      ort.env.wasm.numThreads = 1;\n      const [voiceFile, settings] = await Promise.all([fetchModel(modelUrl), fetchModel(modelUrl + '.json')]);\n      const [modelBytes, voiceConfig] = await Promise.all([\n        readVoiceModel(voiceFile.response),\n        settings.response.json(),\n        voiceFile.save(),\n        settings.save()\n      ]);\n      self.postMessage({ percent: 100 });\n      config = voiceConfig;\n      model = await ort.InferenceSession.create(modelBytes, { executionProviders: ['wasm'] });\n      phonemizer = await createPiperPhonemize({\n        locateFile: file => phonemizerBase + file,\n        print: line => phrases.push(JSON.parse(line))\n      });\n    }\n    phrases = [];\n    phonemizer.callMain(['--espeak_data', '/espeak-ng-data', '--language', config.espeak.voice,\n      '--input', JSON.stringify([{ text }])]);\n    const ids = phrases.flatMap(phrase => phrase.phoneme_ids);\n    const eos = config.phoneme_id_map['$'][0];\n    const samples = [];\n    const gap = new Float32Array(Math.round(config.audio.sample_rate * 0.18));\n    for (let start = 0; start < ids.length;) {\n      const end = ids.indexOf(eos, start);\n      const sentence = ids.slice(start, end < 0 ? ids.length : end + 1);\n      start += sentence.length;\n      const inputs = {\n        input: new ort.Tensor('int64', BigInt64Array.from(sentence, BigInt), [1, sentence.length]),\n        input_lengths: new ort.Tensor('int64', [BigInt(sentence.length)], [1]),\n        scales: new ort.Tensor('float32', [config.inference.noise_scale, config.inference.length_scale / speed, config.inference.noise_w], [3]),\n      };\n      if (config.num_speakers > 1) inputs.sid = new ort.Tensor('int64', [1n], [1]);\n      const { output } = await model.run(inputs);\n      samples.push(new Float32Array(output.data), gap);\n    }\n    if (!samples.length) throw new Error('Piper no produjo audio.');\n    const pcm = new Float32Array(samples.reduce((length, chunk) => length + chunk.length, 0));\n    let offset = 0;\n    for (const chunk of samples) {\n      pcm.set(chunk, offset);\n      offset += chunk.length;\n    }\n    self.postMessage({ id, pcm, sampleRate: config.audio.sample_rate }, [pcm.buffer]);\n  } catch (error) {\n    self.postMessage({ id, error: String(error) });\n  }\n}\n";
+function crearLectorTutoria(selector, velocidad, estado, ocupado) {
+  const synth = window.speechSynthesis;
+  const Audio = window.AudioContext || window.webkitAudioContext;
+  const piper = Boolean(Audio && window.Worker && window.WebAssembly && window.isSecureContext && location.protocol !== 'file:');
+  const ua = navigator.userAgent;
+  const chrome = /\b(?:Chrome|CriOS)\//.test(ua) && !/\b(?:Edg|EdgA|EdgiOS|OPR|SamsungBrowser)\//.test(ua);
+  const safari = /\bVersion\//.test(ua) && /\bSafari\//.test(ua) && !/\b(?:Chrome|CriOS|Chromium|FxiOS|EdgiOS|OPiOS)\//.test(ua);
+  const opciones = chrome ? ['google', 'device', 'piper'] : safari ? ['piper', 'device'] : ['device', 'piper'];
+  const clave = 'voz-tutoria:' + location.pathname;
+  let elegida = '';
+  try { elegida = localStorage.getItem(clave) || ''; } catch {}
+  let worker, audio, source, temporizador, solicitud = 0;
+  let activado = false;
+
+  function voces() {
+    const lista = synth?.getVoices().filter(item => /^es[-_]ES$/i.test(item.lang)) || [];
+    const google = lista.find(item => /google/i.test(item.name));
+    const otras = lista.filter(item => !/google/i.test(item.name));
+    const device = otras.find(item => item.localService && item.default)
+      || otras.find(item => item.localService) || otras.find(item => item.default);
+    return {google, device, otras:otras.filter(item => item.localService && item !== device)};
+  }
+
+  function cargar() {
+    const {google, device, otras} = voces();
+    const googleOption = new Option(google ? 'Google Español' : 'Google Español · No disponible', 'google');
+    googleOption.disabled = !google;
+    selector.replaceChildren(
+      new Option(chrome ? 'Automática · Google Español → Dispositivo → Piper' : safari ? 'Automática · Piper → Dispositivo' : 'Automática · Dispositivo → Piper', ''),
+      googleOption,
+      new Option(device ? 'Dispositivo · ' + device.name : 'Voz del dispositivo', 'device'),
+      new Option('Piper Sharvard · Español de España', 'piper'),
+      ...otras.map(item => new Option(item.name + ' · es-ES', item.voiceURI))
+    );
+    if ([...selector.options].some(o => o.value === elegida && !o.disabled)) selector.value = elegida;
+  }
+
+  function detener() {
+    solicitud++;
+    clearTimeout(temporizador);
+    if (activado) synth?.cancel();
+    activado = false;
+    if (source) {
+      source.onended = null;
+      source.stop();
+      source.disconnect();
+      source = null;
+    }
+    ocupado(false);
+  }
+
+  function hablar(fragmentos) {
+    detener();
+    const cola = fragmentos.map(parte => typeof parte === 'string' ? {text:parte,pause:0} : parte).filter(parte => parte.text?.trim());
+    if (!cola.length) return;
+    const turno = solicitud;
+    const rate = Number(velocidad.value) || 1;
+    const {google, device, otras} = voces();
+    const seleccion = selector.value;
+    const disponibles = {google, device, piper:piper ? 'piper' : null};
+    const orden = seleccion
+      ? [Object.hasOwn(disponibles, seleccion) ? disponibles[seleccion] : otras.find(voz => voz.voiceURI === seleccion)]
+      : opciones.map(clave => disponibles[clave]);
+    const candidatas = orden.filter(Boolean);
+    let indice = 0;
+
+    function finalizar(mensaje) {
+      clearTimeout(temporizador);
+      ocupado(false);
+      estado(mensaje);
+    }
+
+    function probar() {
+      if (turno !== solicitud) return;
+      const voz = candidatas.shift();
+      if (!voz) {
+        finalizar('No se ha podido leer con una voz de español de España. Prueba otra opción del menú.');
+        return;
+      }
+      if (voz === 'piper') {
+        leerPiper();
+        return;
+      }
+      estado('Leyendo con ' + voz.name + '…');
+      function siguiente() {
+        if (turno !== solicitud) return;
+        if (indice === cola.length) { finalizar('Lectura terminada.'); return; }
+        const parte = cola[indice];
+        const frase = new SpeechSynthesisUtterance(parte.text);
+        frase.voice = voz;
+        frase.lang = 'es-ES';
+        frase.rate = rate;
+        frase.onend = () => {
+          if (turno !== solicitud) return;
+          indice++;
+          temporizador = setTimeout(siguiente, parte.pause || 0);
+        };
+        frase.onerror = probar;
+        try { activado = true; synth.speak(frase); }
+        catch { probar(); }
+      }
+      siguiente();
+    }
+
+    function leerPiper() {
+      estado('Preparando la voz de Piper Sharvard…');
+      let fallido = false;
+      function fallo() {
+        if (turno !== solicitud || fallido) return;
+        fallido = true;
+        clearTimeout(temporizador);
+        worker?.terminate();
+        worker = null;
+        probar();
+      }
+      try {
+        audio ||= new Audio();
+        const ready = audio.resume();
+        ready.catch(fallo);
+        if (!worker) {
+          const url = URL.createObjectURL(new Blob([FUENTE_PIPER], {type:'text/javascript'}));
+          try { worker = new Worker(url); }
+          finally { URL.revokeObjectURL(url); }
+        }
+        worker.onerror = fallo;
+        worker.onmessage = async ({data}) => {
+          if (turno !== solicitud || fallido || data.id !== turno) return;
+          if (data.error) { fallo(); return; }
+          try {
+            await ready;
+            if (turno !== solicitud) return;
+            const buffer = audio.createBuffer(1, data.pcm.length, data.sampleRate);
+            buffer.getChannelData(0).set(data.pcm);
+            source = audio.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audio.destination);
+            source.onended = () => {
+              if (turno !== solicitud) return;
+              source.disconnect();
+              source = null;
+              finalizar('Lectura terminada.');
+            };
+            source.start();
+            clearTimeout(temporizador);
+            estado('Leyendo con Piper Sharvard…');
+          } catch { fallo(); }
+        };
+        temporizador = setTimeout(fallo, 240000);
+        worker.postMessage({
+          text:cola.slice(indice).map(parte => parte.text.replace(/([\p{L}\p{N}])$/u, '$1.')).join(' '),
+          speed:rate, modelKey:'piper', id:turno
+        });
+      } catch { fallo(); }
+    }
+
+    ocupado(true);
+    probar();
+  }
+
+  selector.addEventListener('change', () => {
+    elegida = selector.value;
+    try { localStorage.setItem(clave, elegida); } catch {}
+    detener();
+  });
+  synth?.addEventListener('voiceschanged', cargar);
+  cargar();
+  return {hablar, detener};
+}
+
+</script></head>
  <body data-template-id="__page-root" class="app-shell w-full">
   <noscript><p class="load-error">Activa JavaScript para realizar la actividad.</p></noscript>
   <p id="load-error" class="load-error" hidden role="alert">No se ha podido cargar la actividad. Comprueba tu conexión y recarga la página.</p>
@@ -689,31 +860,15 @@ createApp({setup(){
 (() => {
  'use strict';
  const play=document.getElementById('reader-play'), stopButton=document.getElementById('reader-stop'), voiceSelect=document.getElementById('reader-voice'), rateSelect=document.getElementById('reader-rate'), preview=document.getElementById('reader-preview'), status=document.getElementById('reader-status');
- const supported='speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
- let voices=[], preferred='', generation=0, currentUtterance=null;
  const key='organiza-estudio-eso12-reader';
- try {const saved=JSON.parse(localStorage.getItem(key)||'{}');preferred=typeof saved.voice==='string'?saved.voice:'';if(['0.65','0.9','1','1.1'].includes(String(saved.rate)))rateSelect.value=String(saved.rate);}catch(_){}
- function save(){try{localStorage.setItem(key,JSON.stringify({voice:preferred,rate:Number(rateSelect.value)}));}catch(_){}}
- function stop(){generation++;if(supported)window.speechSynthesis.cancel();currentUtterance=null;stopButton.disabled=true;status.textContent='';}
+ try {const saved=JSON.parse(localStorage.getItem(key)||'{}');if(['0.65','0.9','1','1.1'].includes(String(saved.rate)))rateSelect.value=String(saved.rate);}catch{}
+ const lector=crearLectorTutoria(voiceSelect,rateSelect,mensaje=>status.textContent=mensaje,leyendo=>stopButton.disabled=!leyendo);
+ function stop(){lector.detener();status.textContent='';}
  window.addEventListener('study-reader-stop',stop);
  window.addEventListener('pagehide',stop);
  document.addEventListener('visibilitychange',()=>{if(document.hidden)stop();});
  stopButton.addEventListener('click',stop);
- if(!supported){play.disabled=true;preview.disabled=true;voiceSelect.disabled=true;status.textContent='Este navegador no permite la lectura en voz alta.';return;}
- const synth=window.speechSynthesis;
- function loadVoices(){
-  voices=synth.getVoices().filter(v=>/^es(?:[-_]|$)/i.test(v.lang)&&!/^es[-_]mx$/i.test(v.lang));
-  voiceSelect.replaceChildren();
-  if(!voices.length){voiceSelect.add(new Option('No hay voces en español disponibles',''));voiceSelect.disabled=true;play.disabled=true;preview.disabled=true;status.textContent='No hay voces en español disponibles. Comprueba las voces del dispositivo o prueba otro navegador.';return;}
-  voices.forEach(v=>voiceSelect.add(new Option(v.name+' ('+v.lang+')',v.voiceURI)));
-  const selected=voices.find(v=>v.voiceURI===preferred)||voices.find(v=>/^es[-_]ES$/i.test(v.lang)&&/^Google español$/i.test(v.name))||voices.find(v=>/^es[-_]ES$/i.test(v.lang)&&/^M[oó]nica(?:$|\s|\()/i.test(v.name))||voices.find(v=>/^es[-_]ES$/i.test(v.lang))||voices[0];
-  voiceSelect.value=selected.voiceURI;voiceSelect.disabled=false;play.disabled=false;preview.disabled=false;
-  if(stopButton.disabled)status.textContent='';
- }
- synth.addEventListener('voiceschanged',loadVoices);loadVoices();
- [250,1000,3000].forEach(delay=>setTimeout(loadVoices,delay));
- voiceSelect.addEventListener('change',()=>{stop();preferred=voiceSelect.value;save();});
- rateSelect.addEventListener('change',()=>{stop();save();});
+ rateSelect.addEventListener('change',()=>{stop();try{localStorage.setItem(key,JSON.stringify({rate:Number(rateSelect.value)}));}catch{}});
  function visible(el){
   if(el.closest('[hidden],[aria-hidden="true"],.print-only,.print-heading,.print-day,script,style'))return false;
   for(let p=el;p;p=p.parentElement){const c=getComputedStyle(p);if(c.display==='none'||c.visibility==='hidden'||c.visibility==='collapse')return false;}
@@ -815,26 +970,17 @@ createApp({setup(){
  }
  function speak(text){
   stop();if(!text){status.textContent='Espera a que aparezca el contenido y vuelve a pulsar Escuchar.';return;}
-  const voice=voices.find(v=>v.voiceURI===voiceSelect.value);if(!voice){loadVoices();return;}
   // Las mayúsculas son un recurso visual; la voz recibe palabras normales.
   text=text.replace(/\p{Lu}{2,}/gu,word=>word.toLocaleLowerCase('es'));
-  const token=generation, chunks=text.match(/[^.!?;]+[.!?;]*|[.!?;]+/g)||[text];
+  const chunks=text.match(/[^.!?;]+[.!?;]*|[.!?;]+/g)||[text];
   const queue=chunks.flatMap(part=>{
    const pause=/[.!?;…]\s*$/.test(part)?280:0;
    const clean=part.replace(/[.\u2026]/g,' ').replace(/\s+/g,' ').trim();
    if(!/[\p{L}\p{N}]/u.test(clean))return [];
    const pieces=clean.match(/.{1,180}(?:\s|$)|\S{1,180}/g)||[clean];
    return pieces.map((text,i)=>({text:text.trim(),pause:i===pieces.length-1?pause:0}));
-  });let index=0;
-  stopButton.disabled=false;status.textContent='Leyendo…';
-  function next(){
-   if(token!==generation)return;
-   if(index>=queue.length){currentUtterance=null;stopButton.disabled=true;status.textContent='Lectura terminada.';return;}
-   const item=queue[index++]; const u=new SpeechSynthesisUtterance(item.text);currentUtterance=u;u.voice=voice;u.lang=voice.lang;u.rate=Number(rateSelect.value);
-   u.onend=()=>{if(token===generation)setTimeout(next,item.pause);};u.onerror=()=>{if(token!==generation)return;stop();status.textContent='No se ha podido reproducir la voz. Prueba otra voz o navegador.';};
-   try{synth.speak(u);}catch(_){stop();status.textContent='No se ha podido iniciar la lectura. Prueba otra voz o navegador.';}
-  }
-  next();
+  });
+  lector.hablar(queue);
  }
  play.addEventListener('click',()=>speak(readSection()));
  preview.addEventListener('click',()=>speak('Hola. Esta es la voz que te acompañará en la actividad. Vamos a aprender a organizar nuestro estudio.'));
